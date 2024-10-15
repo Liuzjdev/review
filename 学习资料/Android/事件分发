@@ -1,0 +1,624 @@
+参考：
+http://blog.csdn.net/singwhatiwanna/article/details/50775201
+点击事件是由用户的触摸行为所产生的，因此它必须要通过硬件来捕获，然后点击事件会交给WMS来处理。
+
+public class Activity extends ContextThemeWrapper
+              implements  Window.Callback{
+1、Activity的makeVisibile()
+    void makeVisible() {
+        if (!mWindowAdded) {
+            ViewManager wm = getWindowManager();
+            wm.addView(mDecor, getWindow().getAttributes()); //调用WindowManagerImpl的addView
+            mWindowAdded = true;
+        }
+        mDecor.setVisibility(View.VISIBLE);
+    }
+    void  attach(.....){
+       .........
+        mWindow = new PhoneWindow(this, window);
+        mWindow.setWindowControllerCallback(this);
+        mWindow.setCallback(this); //将Activity注入到PhoneWindow中，mWindow持有了Activity的引用，，因此，事件是从Window传递给了Activity
+       ........
+    }
+}
+2、WindowManagerImpl
+public final class WindowManagerImpl implements WindowManager {
+    private final WindowManagerGlobal mGlobal = WindowManagerGlobal.getInstance();
+
+    public void addView(@NonNull View mDecor, @NonNull ViewGroup.LayoutParams params) {
+        applyDefaultToken(params);
+        mGlobal.addView(mDecor, params, mContext.getDisplay(), mParentWindow);
+    }
+}
+3、WindowManagerGlobal
+public final class WindowManagerGlobal {
+    public void addView(View mDecor, ViewGroup.LayoutParams params,Display display, Window parentWindow) {
+
+            final WindowManager.LayoutParams wparams = (WindowManager.LayoutParams) params;
+            ..................
+            ViewRootImpl root;
+            root = new ViewRootImpl(view.getContext(), display); //创建ViewRootImpl
+            mDecor.setLayoutParams(wparams); //给DecorView设置layoutParam
+
+            root.setView(mDecor, wparams, panelParentView);
+    }
+}
+4、ViewRootImpl
+public final class ViewRootImpl implements ViewParent{
+    public void setView(View mDecor, WindowManager.LayoutParams attrs, View panelParentView) {
+            if (mView == null) {
+                mView = mDecor;
+                 //初始化事件相关类
+                mInputChannel = new InputChannel();
+                if (mInputChannel != null) {
+                    if (mInputQueueCallback != null) {
+                        mInputQueue = new InputQueue();
+                        mInputQueueCallback.onInputQueueCreated(mInputQueue);
+                    }
+                    //初始化事件接收器
+                    mInputEventReceiver = new WindowInputEventReceiver(mInputChannel,
+                            Looper.myLooper());
+                }
+             }
+    }
+}
+
+点击事件是由用户的触摸行为所产生的，因此它必须要通过硬件来捕获，然后调用WindowInputEventReceiver的dispatchInputEvent()
+------WindowInputEventReceiver{
+
+    // Called from native code.
+    private void dispatchInputEvent(int seq, InputEvent event) {
+        onInputEvent(event);
+    }
+
+    @Override
+    public void onInputEvent(InputEvent event) {
+        enqueueInputEvent(event, this, 0, true);
+    }
+
+}
+------ViewRootImpl
+    //分发事件
+    public void dispatchInputEvent(InputEvent event) {
+        dispatchInputEvent(event, null);
+    }
+
+    public void dispatchInputEvent(InputEvent event, InputEventReceiver receiver) {
+        SomeArgs args = SomeArgs.obtain();
+        args.arg1 = event;
+        args.arg2 = receiver;
+        Message msg = mHandler.obtainMessage(MSG_DISPATCH_INPUT_EVENT, args);
+        msg.setAsynchronous(true);
+        mHandler.sendMessage(msg); //发送事件
+    }
+    final class ViewRootHandler extends Handler {
+        @Override
+        public void handleMessage(Message msg) {
+             case MSG_DISPATCH_INPUT_EVENT:  //事件分发
+                 SomeArgs args = (SomeArgs)msg.obj;
+                 InputEvent event = (InputEvent)args.arg1;
+                 InputEventReceiver receiver = (InputEventReceiver)args.arg2;
+                 enqueueInputEvent(event, receiver, 0, true); //加入到事件队列中
+                 args.recycle();
+              break;
+      }
+    }
+    //事件队列
+    void enqueueInputEvent(InputEvent event,
+            InputEventReceiver receiver, int flags, boolean processImmediately) {
+          ..........
+        if (processImmediately) { //立即处理
+            doProcessInputEvents();
+        } else {
+            scheduleProcessInputEvents();
+        }
+    }
+    void doProcessInputEvents() {
+        while (mPendingInputEventHead != null) {
+             ..............
+            mChoreographer.mFrameInfo.updateInputEventTime(eventTime, oldestEventTime);
+
+            deliverInputEvent(q); //分发事件
+        }
+     }
+   }
+    private void deliverInputEvent(QueuedInputEvent q) {
+        ............
+        InputStage stage;
+        if (q.shouldSendToSynthesizer()) {
+            stage = mSyntheticInputStage; //ViewPostImeInputStage
+        } else {
+            stage = q.shouldSkipIme() ? mFirstPostImeInputStage : mFirstInputStage;
+        }
+
+        if (stage != null) {
+            stage.deliver(q); //会调用到ViewPostImeInputStage.processPointerEvent()
+        } else {
+            finishInputEvent(q);
+        }
+    }
+    final class ViewPostImeInputStage extends InputStage {
+        private int processPointerEvent(QueuedInputEvent q) {
+            final MotionEvent event = (MotionEvent)q.mEvent;
+              View  view =mDecor;
+            boolean handled = view.dispatchPointerEvent(event);
+            return handled ? FINISH_HANDLED : FORWARD;
+        }
+    }
+----View
+        public final boolean dispatchPointerEvent(MotionEvent event) {
+            if (event.isTouchEvent()) {
+                return dispatchTouchEvent(event); //回调到DecorView中的dispatchTouchEvent
+            } else {
+                return dispatchGenericMotionEvent(event);
+            }
+        }
+----DecorView
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        final Window.Callback cb = mWindow.getCallback();
+        //回调Window.Callback.dispatchTouchEvent(ev)
+        //由于Activity实现了Window.Callback, （在Activity的onAttach中注册的），这样就事件回调到了Activity中
+        return cb != null && !mWindow.isDestroyed() && mFeatureId < 0
+                ? cb.dispatchTouchEvent(ev) : super.dispatchTouchEvent(ev);
+    }
+     //由Activity的dispatchTouchEvent中调用
+    @Override
+    public boolean superDispatchTouchEvent(MotionEvent event) {
+        return mDecor.superDispatchTouchEvent(event); //回调到ViewGroup的dispatchTouchEvent中
+    }
+
+----事件回调到Activity中
+1、触摸事件默认都是从Activity的DispatchTouchEvent开发分发的
+public boolean dispatchTouchEvent(MotionEvent ev) {
+    if (ev.getAction() == MotionEvent.ACTION_DOWN) {
+        onUserInteraction();
+    }
+    if (getWindow().superDispatchTouchEvent(ev)) { //然后将事件传递给Window
+        return true;
+    }
+    return onTouchEvent(ev); //如View都不消费事件
+}
+
+2、PhoneWindow中,交给DecorView的superDispatchTouchEvent处理
+@Override
+public boolean superDispatchTouchEvent(MotionEvent event) {
+    return mDecor.superDispatchTouchEvent(event);//交给DecorView处理
+}
+
+3、DecorView中处理dispatchTouchEvent
+private final class DecorView extends FrameLayout{
+       public boolean superDispatchTouchEvent(MotionEvent event) {
+            return super.dispatchTouchEvent(event); //回调到ViewGroup中的dispatchTouchEvent
+        }
+}
+4、ViewGroup
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+
+             boolean intercepted=false;
+            //触摸事件按下时，首先判断子View不允许拦截子类是否调用了requestDisallowInterceptTouchEvent
+            if (actionMasked == MotionEvent.ACTION_DOWN
+                    || mFirstTouchTarget != null) {
+                final boolean disallowIntercept = (mGroupFlags & FLAG_DISALLOW_INTERCEPT) != 0;
+                if (disallowIntercept) {
+                    intercepted = false; //子类不允许父类拦截事件
+                } else {
+                    intercepted = onInterceptTouchEvent(ev); //交给自己的onInterceptTouchEvent,返回true则表示消耗事件
+                    ev.setAction(action);
+                }
+            } else {
+                intercepted = true;
+            }
+
+
+            //便利所有child，向下传递事件，并将事件触摸对象添加到链表中
+            if(!intercepted){
+                 for (int i = childrenCount - 1; i >= 0; i--) {
+                    final View child =getChild();
+                    if(dispatchTransformedTouchEvent(event,child)){
+                            final TouchTarget target = TouchTarget.obtain(child, pointerIdBits);
+                            target.next = mFirstTouchTarget;
+                            mFirstTouchTarget = target;
+                    }
+                  }
+            }
+
+          //开始处理触摸事件链表
+          boolean handled = false;
+            if (mFirstTouchTarget == null) {
+                handled = dispatchTransformedTouchEvent(ev, null);
+            } else {
+                TouchTarget target = mFirstTouchTarget;
+                while (target != null) {
+                    final TouchTarget next = target.next; //得到下一个事件
+                    if (dispatchTransformedTouchEvent(ev, target.child)) {
+                        handled = true;
+                    }
+                    target = next;
+                }
+            }
+           return handled;
+    }
+    private boolean dispatchTransformedTouchEvent(MotionEvent event,View child) {
+        final boolean handled;
+        if (child == null) {
+            handled = super.dispatchTouchEvent(event);
+        } else {
+            handled = child.dispatchTouchEvent(event);
+          }
+        return handled;
+     }
+
+
+ --------------------super.dispatchTouchEvent 即View中的dispatchTouchEvent----------
+            //View中的dispatchTouchEvent
+            ListenerInfo li = mListenerInfo;
+            if (li != null && li.mOnTouchListener != null
+                    && (mViewFlags & ENABLED_MASK) == ENABLED
+                    && li.mOnTouchListener.onTouch(this, event)) { // 1、处理onTouchListener
+                result = true;
+            }
+
+            if (!result && onTouchEvent(event)) { //2、调用onTouchEvent
+                result = true;
+            }
+
+            //View中的onTouchEvent
+            case ACTION_UP:
+                   performClick(); //3、处理点击事件
+             break;
+
+    @Override
+    public void requestDisallowInterceptTouchEvent(boolean disallowIntercept) {
+        if (disallowIntercept == ((mGroupFlags & FLAG_DISALLOW_INTERCEPT) != 0)) {
+            return;
+        }
+        if (disallowIntercept) {
+            mGroupFlags |= FLAG_DISALLOW_INTERCEPT;
+        } else {
+            mGroupFlags &= ~FLAG_DISALLOW_INTERCEPT;
+        }
+
+        // Pass it up to our parent
+        if (mParent != null) {
+            mParent.requestDisallowInterceptTouchEvent(disallowIntercept);
+        }
+    }
+
+Activity
+   ---dispatchTouchEvent
+   ---OnTouchEvent
+ViewGroup
+   ---dispatchTouchEvent
+   ---onInterceptTouchEvent
+   ---OnTouchEvent
+View
+   ---dispatchTouchEvent
+   ---OnTouchEvent
+
+二、dispatchTouchEvent->onInterceptTouchEvent->onTouchEvent
+Activity
+   --RootLinearLayout
+     --MyRelativeLayout
+        --MyTextView
+
+ Activity------dispatchTouchEvent-------ACTION_DOWN
+ RootLinearLayout------dispatchTouchEvent-------ACTION_DOWN
+ RootLinearLayout------onInterceptTouchEvent-------ACTION_DOWN
+ MyRelativeLayout------dispatchTouchEvent-------ACTION_DOWN
+ MyRelativeLayout------onInterceptTouchEvent-------ACTION_DOWN
+ MyTextView------dispatchTouchEvent-------ACTION_DOWN
+ MyTextView------onTouchEvent-------ACTION_DOWN
+ MyRelativeLayout------onTouchEvent-------ACTION_DOWN
+ RootLinearLayout------onTouchEvent-------ACTION_DOWN
+ Activity------onTouchEvent-------ACTION_DOWN
+ Activity------dispatchTouchEvent-------ACTION_MOVE
+ Activity------onTouchEvent-------ACTION_MOVE
+ Activity------dispatchTouchEvent------ACTION_UP
+ Activity------onTouchEvent------ACTION_UP
+
+
+1、ViewGroup
+   dispatchTouchEvent->onInterceptTouchEvent，如果不拦截事件，则继续向下分发，否则交给自己的onTouchEvent处理
+   如果dispatchTouchEvent返回true，则不交给自己的onInterceptTouchEvent，所以很少去重写dispatchTouchEvent方法，而是重写onInterceptTouchEvent
+2、View
+   dispatchTouchEvent->onTouchEvent
+
+onTouchEvent返回false，表示不消费事件，交由父类去处理，并且不再接受后续事件，比如ActionDown返回false，则不再接收ActionMove和ActionUp。
+
+三、OnTouchListener & OnClickListener
+给View设置onTouchListener，则onTouch方法会比onTouchEvent先执行，我们看看View中的dispatchTouchEvent方法
+onClickListener或onLongClickListener会比onTouchEvent后执行
+
+public class View {
+ public boolean dispatchTouchEvent(MotionEvent event) {
+
+        boolean result = false;
+        if (onFilterTouchEventForSecurity(event)) {
+            ListenerInfo li = mListenerInfo;
+            if (li != null && li.mOnTouchListener != null
+                    && (mViewFlags & ENABLED_MASK) == ENABLED
+                    && li.mOnTouchListener.onTouch(this, event)) { //先执行onTouch
+                result = true;
+            }
+
+           //如果onTouch不消费事件，则交由onTouchEvent执行
+            if (!result && onTouchEvent(event)) {
+                result = true;
+            }
+        }
+        return result;
+    }
+
+ public boolean onTouchEvent(MotionEvent event) {
+        final float x = event.getX();
+        final float y = event.getY();
+        final int viewFlags = mViewFlags;
+        final int action = event.getAction();
+
+        //先处理onTouchEvent
+        if (mTouchDelegate != null) {
+            if (mTouchDelegate.onTouchEvent(event)) { //如果消费了onTouchEvent，则直接返回
+                return true;
+            }
+        }
+        //再处理onClick，onLongClick
+        if (((viewFlags & CLICKABLE) == CLICKABLE ||
+                (viewFlags & LONG_CLICKABLE) == LONG_CLICKABLE) ||
+                (viewFlags & CONTEXT_CLICKABLE) == CONTEXT_CLICKABLE) {
+            switch (action) {
+                case MotionEvent.ACTION_UP:
+                    boolean prepressed = (mPrivateFlags & PFLAG_PREPRESSED) != 0;
+                            if (!focusTaken) {
+                                if (mPerformClick == null) {
+                                    mPerformClick = new PerformClick();
+                                }
+
+                                if (!post(mPerformClick)) {
+                                    performClick(); //执行点击事件
+                                }
+                            }
+                    break;
+                case MotionEvent.ACTION_DOWN:
+                    break;
+                case MotionEvent.ACTION_CANCEL:
+                    break;
+
+                case MotionEvent.ACTION_MOVE:
+                    break;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+     //执行点击事件
+    public boolean performClick() {
+        final boolean result;
+        final ListenerInfo li = mListenerInfo;
+        if (li != null && li.mOnClickListener != null) {
+            playSoundEffect(SoundEffectConstants.CLICK); //点击音效
+            li.mOnClickListener.onClick(this); //执行onClick
+            result = true;
+        } else {
+            result = false;
+        }
+
+        sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_CLICKED); //发送点击事件
+        return result;
+    }
+
+
+}
+
+Activity
+    --MyLinearLayout
+        --MyView
+
+1、点击MyView  不拦截处理任何事件
+2022-04-06 18:01:23.248 9275-9275/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:01:23.250 9275-9275/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:01:23.250 9275-9275/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+2022-04-06 18:01:23.250 9275-9275/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:01:23.251 9275-9275/com.example.demo I/System.out: MyView onTouchEvent ACTION_DOWN
+2022-04-06 18:01:23.253 9275-9275/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_DOWN
+2022-04-06 18:01:23.253 9275-9275/com.example.demo I/System.out: MainActivity onTouchEvent ACTION_DOWN
+2022-04-06 18:01:23.363 9275-9275/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+                                               --不再向父容器MyLinearLayout传递，因为action  down都没有消费
+2022-04-06 18:01:23.364 9275-9275/com.example.demo I/System.out: MainActivity onTouchEvent ACTION_UP
+
+2、点击MyView.onTouchEvent返回true
+父容器MyLinearLayout和Activity的onTouchEvent不再回调事件。(事件被消费了)
+2022-04-06 17:58:24.303 8983-8983/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 17:58:24.304 8983-8983/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 17:58:24.305 8983-8983/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+2022-04-06 17:58:24.305 8983-8983/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_DOWN
+2022-04-06 17:58:24.306 8983-8983/com.example.demo I/System.out: MyView onTouchEvent ACTION_DOWN
+                                                      --MyView.onTouchEvent返回true 继续派发action up
+2022-04-06 17:58:24.407 8983-8983/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+2022-04-06 17:58:24.409 8983-8983/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_UP
+2022-04-06 17:58:24.409 8983-8983/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_UP
+2022-04-06 17:58:24.410 8983-8983/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_UP
+2022-04-06 17:58:24.410 8983-8983/com.example.demo I/System.out: MyView onTouchEvent ACTION_UP
+
+3、父容器MyLinearLayout.onTouchEvent返回true
+那么不再向Activity.onTouchEvent传递(被消费了)，之后子MyView也不再接收任何事件(被拦截了)
+2022-04-06 18:06:44.606 9468-9468/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:06:44.607 9468-9468/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:06:44.607 9468-9468/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+2022-04-06 18:06:44.608 9468-9468/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:06:44.608 9468-9468/com.example.demo I/System.out: MyView onTouchEvent ACTION_DOWN
+2022-04-06 18:06:44.608 9468-9468/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_DOWN
+                                               ---MyLinearLayout.onTouchEvent返回true 子View不再接受任何事件
+2022-04-06 18:06:44.705 9468-9468/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+2022-04-06 18:06:44.705 9468-9468/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_UP
+2022-04-06 18:06:44.706 9468-9468/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_UP
+
+4、MyLinearLayout.onInterceptTouchEvent返回true 拦截事件
+2022-04-06 18:23:38.205 10148-10148/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:23:38.206 10148-10148/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:23:38.206 10148-10148/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+                                               --onInterceptTouchEvent返回true 拦截事件  不再向子View分发事件
+2022-04-06 18:23:38.207 10148-10148/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_DOWN --自己处理
+2022-04-06 18:23:38.207 10148-10148/com.example.demo I/System.out: MainActivity onTouchEvent ACTION_DOWN
+2022-04-06 18:23:38.320 10148-10148/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+                                               --不再向父容器MyLinearLayout传递事件，因为action down没有消费事件
+2022-04-06 18:23:38.321 10148-10148/com.example.demo I/System.out: MainActivity onTouchEvent ACTION_UP
+
+5、MyLinearLayout.onInterceptTouchEvent返回true 拦截事件
+MyLinearLayout.onTouchEvent返回true 消费事件
+2022-04-06 18:27:27.145 10321-10321/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:27:27.146 10321-10321/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:27:27.147 10321-10321/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+                                                --onInterceptTouchEvent返回true 拦截事件  不再向子View分发事件
+2022-04-06 18:27:27.147 10321-10321/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_DOWN
+                                                --MyLinearLayout.onTouchEvent返回true消费事件 继续接收后续事件
+2022-04-06 18:27:27.256 10321-10321/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+2022-04-06 18:27:27.256 10321-10321/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_UP
+                                                --因为MyLinearLayout自己消费了onTouchEvent，没必要拦截事件了(onInterceptTouchEvent)
+2022-04-06 18:27:27.257 10321-10321/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_UP
+
+6、MyView.onTouchEvent返回true
+后续事件action move，action up被父容器MyLinearLayout.onInterceptTouchEvent拦截
+场景：触摸列表容器中的某个item滑动，列表会滚动，不能因为item.onTouchEvent返回true，父容器就不执行滑动了
+
+2022-04-06 18:37:42.939 10643-10643/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:37:42.940 10643-10643/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:37:42.940 10643-10643/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+2022-04-06 18:37:42.940 10643-10643/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_DOWN
+2022-04-06 18:37:42.940 10643-10643/com.example.demo I/System.out: MyView onTouchEvent ACTION_DOWN
+                                         --MyView.onTouchEvent返回true 消费了事件 继续接收后续事件
+2022-04-06 18:37:43.028 10643-10643/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_MOVE
+2022-04-06 18:37:43.029 10643-10643/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_MOVE
+2022-04-06 18:37:43.029 10643-10643/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_MOVE
+                --MyLinearLayout.onInterceptTouchEvent返回true 拦截action move事件，则子View会收到action cancel
+2022-04-06 18:37:43.029 10643-10643/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_CANCEL
+2022-04-06 18:37:43.030 10643-10643/com.example.demo I/System.out: MyView onTouchEvent ACTION_CANCEL
+2022-04-06 18:37:43.149 10643-10643/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_MOVE
+2022-04-06 18:37:43.150 10643-10643/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_MOVE
+2022-04-06 18:37:43.151 10643-10643/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_MOVE
+                                            ---重复action move事件 不再调用onInterceptTouchEvent(已经返回了true)
+2022-04-06 18:37:43.173 10643-10643/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_MOVE
+2022-04-06 18:37:43.174 10643-10643/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_MOVE
+2022-04-06 18:37:43.174 10643-10643/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_MOVE
+                                                            ---action up 事件
+2022-04-06 18:37:43.357 10643-10643/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+2022-04-06 18:37:43.359 10643-10643/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_UP
+2022-04-06 18:37:43.359 10643-10643/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_UP
+
+
+ListView{
+    public boolean onInterceptTouchEvent(MotionEvent ev) {
+        case MotionEvent.ACTION_MOVE: {
+            switch (mTouchMode) {
+            case TOUCH_MODE_DOWN:
+                if (startScrollIfNeeded((int) ev.getX(pointerIndex), y, null)) {
+                    return true; //如果垂直滑动 则拦截事件
+                }
+                break;
+            }
+            break;
+        }
+    }
+
+    private boolean startScrollIfNeeded(int x, int y, MotionEvent vtev) {
+        final int deltaY = y - mMotionY; //计算滑动距离
+        final int distance = Math.abs(deltaY);
+        int mTouchSlop = ViewConfiguration.get(mContext).getScaledTouchSlop();
+        if (distance > mTouchSlop) { //有效的滑动（大于最小滑动距离）
+            scrollIfNeeded(x, y, vtev);
+            return true;
+         }
+    }
+
+}
+
+7、Activity.dispatchTouchEvent返回true  则父容器不会接收任何事件
+2022-04-06 19:02:46.580 11057-11057/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:02:46.672 11057-11057/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+
+8、给MyView设置onTouchListener、OnClickListener
+1）、执行顺序
+MyView.dispatchTouchEvent ..MyView.onTouch ....MyView.onTouchEvent ...<action up> ...MyView.onClick
+
+2022-04-06 19:17:54.841 11453-11453/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:17:54.845 11453-11453/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:17:54.845 11453-11453/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+2022-04-06 19:17:54.845 11453-11453/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:17:54.846 11453-11453/com.example.demo I/System.out: MyView onTouch ACTION_DOWN
+2022-04-06 19:17:54.846 11453-11453/com.example.demo I/System.out: MyView onTouchEvent ACTION_DOWN
+2022-04-06 19:17:54.973 11453-11453/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+2022-04-06 19:17:54.974 11453-11453/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_UP
+2022-04-06 19:17:54.974 11453-11453/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_UP
+2022-04-06 19:17:54.974 11453-11453/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_UP
+2022-04-06 19:17:54.975 11453-11453/com.example.demo I/System.out: MyView onTouch ACTION_UP
+2022-04-06 19:17:54.975 11453-11453/com.example.demo I/System.out: MyView onTouchEvent ACTION_UP
+2022-04-06 19:17:54.990 11453-11453/com.example.demo I/System.out: MyView onClick
+
+2）如果onTouch返回true
+2022-04-06 19:21:35.457 11594-11594/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:21:35.458 11594-11594/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:21:35.459 11594-11594/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+2022-04-06 19:21:35.463 11594-11594/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:21:35.464 11594-11594/com.example.demo I/System.out: MyView onTouch ACTION_DOWN
+                                                                  --不再执行onTouchEvent
+2022-04-06 19:21:35.566 11594-11594/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+2022-04-06 19:21:35.567 11594-11594/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_UP
+2022-04-06 19:21:35.567 11594-11594/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_UP
+2022-04-06 19:21:35.567 11594-11594/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_UP
+2022-04-06 19:21:35.568 11594-11594/com.example.demo I/System.out: MyView onTouch ACTION_UP
+                                                                  --不再执行onClick
+
+3）父容器MyLinearLayout的onInterceptTouchEvent拦截move事件(和滑动容器拦截滑动事件处理一致)
+2022-04-06 19:25:20.693 11742-11742/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:25:20.694 11742-11742/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:25:20.695 11742-11742/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_DOWN
+2022-04-06 19:25:20.695 11742-11742/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_DOWN
+2022-04-06 19:25:20.695 11742-11742/com.example.demo I/System.out: MyView onTouch ACTION_DOWN
+                                           ---MyView.onTouch返回true 继续分发后续事件
+2022-04-06 19:25:20.725 11742-11742/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_MOVE
+2022-04-06 19:25:20.726 11742-11742/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_MOVE
+2022-04-06 19:25:20.726 11742-11742/com.example.demo I/System.out: MyLinearLayout onInterceptTouchEvent ACTION_MOVE
+                                           ---父容器MyLinearLayout.onInterceptTouchEvent拦截move事件
+2022-04-06 19:25:20.726 11742-11742/com.example.demo I/System.out: MyView dispatchTouchEvent ACTION_CANCEL
+2022-04-06 19:25:20.726 11742-11742/com.example.demo I/System.out: MyView onTouch ACTION_CANCEL
+                                           ---父容器MyLinearLayout自己处理move事件
+2022-04-06 19:25:21.162 11742-11742/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_MOVE
+2022-04-06 19:25:21.162 11742-11742/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_MOVE
+2022-04-06 19:25:21.162 11742-11742/com.example.demo I/System.out: MyLinearLayout onTouch ACTION_MOVE
+2022-04-06 19:25:21.163 11742-11742/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_MOVE
+                                           ---action up事件
+2022-04-06 19:25:21.392 11742-11742/com.example.demo I/System.out: MainActivity dispatchTouchEvent ACTION_UP
+2022-04-06 19:25:21.396 11742-11742/com.example.demo I/System.out: MyLinearLayout dispatchTouchEvent ACTION_UP
+2022-04-06 19:25:21.397 11742-11742/com.example.demo I/System.out: MyLinearLayout onTouch ACTION_UP
+2022-04-06 19:25:21.397 11742-11742/com.example.demo I/System.out: MyLinearLayout onTouchEvent ACTION_UP
+
+
+总结：
+1、onTouchEvent
+消费事件，子View消费了(比如action down) 则不再向父容器传递，继续接收后续事件，
+父容器消费了(比如action down)，再后续事件不再向子View分发。
+2、onInterceptTouchEvent
+拦截事件，返回true 则不再向子View分发事件，由自己的onTouchEvent处理。
+3、ACTION_CANCEL
+比如子View消费了ACTION_DOWN,但是父容器拦截了ACTION_MOVE，因为要恢复子View的状态，比如action down显示被压下状态，
+则子View会接收到ACTION CANCEL事件。
+比如：容器滑动事件(ListView)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
